@@ -1,404 +1,646 @@
+
 #include <Arduino.h>
 
-// =====================================================
-// 1. CONFIGURACOES GERAIS
-// =====================================================
+// ============================================================
+// SISTEMA DE MEDICAO DE ROTACAO - FORMULA SAE
+// Arduino Nano classico (ATmega328P)
+// Dois sensores opticos, um por eixo
+// ============================================================
 
-const uint8_t PINO_SENSOR_1 = 2;  // INT0 - Eixo 1
-const uint8_t PINO_SENSOR_2 = 3;  // INT1 - Eixo 2
+// ------------------------------------------------------------
+// 1. CONFIGURACOES
+// ------------------------------------------------------------
 
-const uint32_t PPR = 30;          // Pulsos por revolucao
+// Pinos dos sensores
+const uint8_t PINO_SENSOR_1 = 2;
+const uint8_t PINO_SENSOR_2 = 3;
 
-const float RAIO_RODA_M = 0.26f;
-const float PI_F = 3.14159265f;
+// Disco fonico
+const uint16_t PPR = 30;  // 30 aberturas = 30 pulsos por volta
 
-// Perímetro da roda já medido em metros (63 cm = 0.63 metros)
-const float PERIMETRO_RODA_M = 0.63f;
+// Borda de deteccao.
+// RISING: transicao LOW -> HIGH
+// FALLING: transicao HIGH -> LOW
+// RISING foi a configuracao anteriormente testada.
+const int BORDA_SENSOR = RISING;
 
-// Relacao entre RPM da roda e RPM do eixo medido.
-// 1.0 = mesma rotacao.
-const float FATOR_ROTACAO_RODA = 1.0f;
+// Entrada eletrica:
+// INPUT nao ativa o pull-up interno de 5 V.
+// A saida do sensor precisa ter nivel logico definido
+// por circuito push-pull ou pull-up externo adequado.
+const uint8_t MODO_ENTRADA = INPUT;
 
-// Timeout: 1,5 segundo sem pulsos
-const uint32_t TIMEOUT_PARADO_US = 1500000UL;
-
-// Filtro antirruido: intervalo minimo entre pulsos
+// Filtro contra pulsos muito proximos
 const uint32_t FILTRO_MIN_US = 200UL;
 
-// Atualizacao serial: 100 ms (aproximadamente 10 Hz)
+// Tempo sem pulsos para considerar o eixo parado
+const uint32_t TIMEOUT_PARADO_US = 2000000UL;
+
+// Intervalos de atualizacao
 const uint32_t INTERVALO_SERIAL_MS = 100UL;
 
+// ------------------------------------------------------------
+// 2. VELOCIDADE
+// ------------------------------------------------------------
 
-// =====================================================
-// 2. VARIAVEIS COMPARTILHADAS - EIXO 1
-// =====================================================
+// Deixe 0 ate medir a circunferencia real da roda.
+#define HABILITAR_VELOCIDADE 0
 
+// Parametros provisórios. Nao serao usados enquanto
+// HABILITAR_VELOCIDADE estiver em 0.
+const float PERIMETRO_RODA_M = 0.63f;
+const float FATOR_ROTACAO_RODA = 1.0f;
+
+// ------------------------------------------------------------
+// 3. CARTAO SD
+// ------------------------------------------------------------
+
+// Deixe 0 enquanto o modulo SD nao estiver instalado.
+// Altere para 1 depois de conectar e verificar o modulo.
+#define HABILITAR_SD 0
+
+#if HABILITAR_SD
+  #include <SPI.h>
+  #include <SD.h>
+
+  const uint8_t PINO_CS_SD = 4;
+  const uint8_t PINO_SPI_SS = 10;
+
+  const uint32_t INTERVALO_SD_MS = 250UL;
+  const uint32_t INTERVALO_FLUSH_MS = 2000UL;
+
+  File arquivoLog;
+  bool sdDisponivel = false;
+
+  uint32_t ultimaGravacaoSD = 0;
+  uint32_t ultimoFlushSD = 0;
+#endif
+
+// ------------------------------------------------------------
+// 4. DADOS COMPARTILHADOS COM AS INTERRUPCOES
+// ------------------------------------------------------------
+
+// Eixo 1
 volatile uint32_t ultimoPulso1 = 0;
 volatile uint32_t periodo1 = 0;
+volatile bool temReferencia1 = false;
+volatile bool periodoValido1 = false;
+volatile bool jaRecebeuPulso1 = false;
 
-volatile bool referencia1 = false;
-volatile bool novoDado1 = false;
-
-
-// =====================================================
-// 3. VARIAVEIS COMPARTILHADAS - EIXO 2
-// =====================================================
-
+// Eixo 2
 volatile uint32_t ultimoPulso2 = 0;
 volatile uint32_t periodo2 = 0;
+volatile bool temReferencia2 = false;
+volatile bool periodoValido2 = false;
+volatile bool jaRecebeuPulso2 = false;
 
-volatile bool referencia2 = false;
-volatile bool novoDado2 = false;
+// ------------------------------------------------------------
+// 5. ESTADOS
+// ------------------------------------------------------------
 
+enum EstadoEixo {
+  SEM_SINAL,
+  AGUARDANDO,
+  ATIVO,
+  PARADO
+};
 
-// =====================================================
-// 4. INTERRUPCAO DO SENSOR 1
-// =====================================================
+EstadoEixo estado1 = SEM_SINAL;
+EstadoEixo estado2 = SEM_SINAL;
 
-void ISR_Sensor1() {
+EstadoEixo estadoAnterior1 = SEM_SINAL;
+EstadoEixo estadoAnterior2 = SEM_SINAL;
 
-    uint32_t agora = micros();
+// ------------------------------------------------------------
+// 6. MEDIDAS
+// ------------------------------------------------------------
 
-    // Primeiro pulso: estabelece a referencia.
-    if (!referencia1) {
-
-        ultimoPulso1 = agora;
-        referencia1 = true;
-
-        return;
-    }
-
-    // Calcula o intervalo entre pulsos.
-    uint32_t delta = agora - ultimoPulso1;
-
-    // Filtro antirruido.
-    if (delta >= FILTRO_MIN_US) {
-
-        ultimoPulso1 = agora;
-        periodo1 = delta;
-
-        novoDado1 = true;
-    }
-}
-
-
-// =====================================================
-// 5. INTERRUPCAO DO SENSOR 2
-// =====================================================
-
-void ISR_Sensor2() {
-
-    uint32_t agora = micros();
-
-    // Primeiro pulso: estabelece a referencia.
-    if (!referencia2) {
-
-        ultimoPulso2 = agora;
-        referencia2 = true;
-
-        return;
-    }
-
-    // Calcula o intervalo entre pulsos.
-    uint32_t delta = agora - ultimoPulso2;
-
-    // Filtro antirruido.
-    if (delta >= FILTRO_MIN_US) {
-
-        ultimoPulso2 = agora;
-        periodo2 = delta;
-
-        novoDado2 = true;
-    }
-}
-
-
-// =====================================================
-// 6. VARIAVEIS DO PROGRAMA PRINCIPAL
-// =====================================================
-
-// Grandezas calculadas
 float rpm1 = 0.0f;
 float rpm2 = 0.0f;
 
 float velocidade1 = 0.0f;
 float velocidade2 = 0.0f;
 
-// Estados de funcionamento
-bool eixo1Ativo = false;
-bool eixo2Ativo = false;
+uint32_t ultimaImpressaoSerial = 0;
 
-// Indica se ja existe uma medicao valida
-bool medicaoValida1 = false;
-bool medicaoValida2 = false;
+// ------------------------------------------------------------
+// 7. INTERRUPCAO - EIXO 1
+// ------------------------------------------------------------
 
-// Historico dos estados para detectar mudancas
-bool estadoAnterior1 = false;
-bool estadoAnterior2 = false;
+void ISR_Sensor1() {
 
-// Controle da impressao serial
-uint32_t ultimaImpressaoMs = 0;
+  const uint32_t agora = micros();
 
+  jaRecebeuPulso1 = true;
 
-// =====================================================
-// 7. CONFIGURACAO INICIAL
-// =====================================================
+  // Primeiro pulso: estabelece a referencia temporal
+  if (!temReferencia1) {
+    ultimoPulso1 = agora;
+    temReferencia1 = true;
+    periodoValido1 = false;
+    return;
+  }
+
+  const uint32_t delta = agora - ultimoPulso1;
+
+  // Ignora pulsos muito proximos
+  if (delta < FILTRO_MIN_US) {
+    return;
+  }
+
+  ultimoPulso1 = agora;
+  periodo1 = delta;
+  periodoValido1 = true;
+}
+
+// ------------------------------------------------------------
+// 8. INTERRUPCAO - EIXO 2
+// ------------------------------------------------------------
+
+void ISR_Sensor2() {
+
+  const uint32_t agora = micros();
+
+  jaRecebeuPulso2 = true;
+
+  if (!temReferencia2) {
+    ultimoPulso2 = agora;
+    temReferencia2 = true;
+    periodoValido2 = false;
+    return;
+  }
+
+  const uint32_t delta = agora - ultimoPulso2;
+
+  if (delta < FILTRO_MIN_US) {
+    return;
+  }
+
+  ultimoPulso2 = agora;
+  periodo2 = delta;
+  periodoValido2 = true;
+}
+
+// ------------------------------------------------------------
+// 9. NOME DOS ESTADOS
+// ------------------------------------------------------------
+
+const char* nomeEstado(EstadoEixo estado) {
+
+  switch (estado) {
+
+    case SEM_SINAL:
+      return "SEM_SINAL";
+
+    case AGUARDANDO:
+      return "AGUARDANDO";
+
+    case ATIVO:
+      return "ATIVO";
+
+    case PARADO:
+      return "PARADO";
+  }
+
+  return "ERRO";
+}
+
+// ------------------------------------------------------------
+// 10. CALCULO DE RPM
+// ------------------------------------------------------------
+
+float calcularRPM(uint32_t periodo) {
+
+  if (periodo == 0 || PPR == 0) {
+    return 0.0f;
+  }
+
+  return 60000000.0f /
+         ((float)PPR * (float)periodo);
+}
+
+// ------------------------------------------------------------
+// 11. CALCULO DE VELOCIDADE
+// ------------------------------------------------------------
+
+float calcularVelocidade(float rpm) {
+
+#if HABILITAR_VELOCIDADE
+
+  return rpm *
+         FATOR_ROTACAO_RODA *
+         PERIMETRO_RODA_M *
+         60.0f / 1000.0f;
+
+#else
+
+  return 0.0f;
+
+#endif
+}
+
+// ------------------------------------------------------------
+// 12. INICIALIZACAO DO SD
+// ------------------------------------------------------------
+
+#if HABILITAR_SD
+
+void iniciarSD() {
+
+  pinMode(PINO_SPI_SS, OUTPUT);
+  digitalWrite(PINO_SPI_SS, HIGH);
+
+  pinMode(PINO_CS_SD, OUTPUT);
+  digitalWrite(PINO_CS_SD, HIGH);
+
+  SPI.begin();
+
+  Serial.print(F("Inicializando SD... "));
+
+  if (!SD.begin(PINO_CS_SD)) {
+    Serial.println(F("FALHA"));
+    sdDisponivel = false;
+    return;
+  }
+
+  arquivoLog = SD.open("RPMLOG.CSV", FILE_WRITE);
+
+  if (!arquivoLog) {
+    Serial.println(F("ERRO AO ABRIR ARQUIVO"));
+    sdDisponivel = false;
+    return;
+  }
+
+  // Cria cabecalho somente se o arquivo estiver vazio
+  if (arquivoLog.size() == 0) {
+
+    arquivoLog.println(
+      F("Tempo_ms,"
+        "Estado1,Periodo1_us,RPM1,Vel1_kmh,"
+        "Estado2,Periodo2_us,RPM2,Vel2_kmh")
+    );
+
+    arquivoLog.flush();
+
+    if (arquivoLog.getWriteError()) {
+      Serial.println(F("ERRO NO CABECALHO"));
+      arquivoLog.close();
+      sdDisponivel = false;
+      return;
+    }
+  }
+
+  sdDisponivel = true;
+
+  Serial.println(F("SD OK"));
+  Serial.println(F("Arquivo: RPMLOG.CSV"));
+}
+
+#endif
+
+// ------------------------------------------------------------
+// 13. IMPRESSAO SERIAL
+// ------------------------------------------------------------
+
+void imprimirEixo(
+  const char* nome,
+  EstadoEixo estado,
+  float rpm,
+  float velocidade
+) {
+
+  Serial.print(nome);
+  Serial.print(F(": "));
+  Serial.print(nomeEstado(estado));
+
+  if (estado == ATIVO) {
+
+    Serial.print(F(" | "));
+    Serial.print(rpm, 2);
+    Serial.print(F(" RPM"));
+
+#if HABILITAR_VELOCIDADE
+
+    Serial.print(F(" | "));
+    Serial.print(velocidade, 2);
+    Serial.print(F(" km/h"));
+
+#else
+
+    Serial.print(F(" | Velocidade: N/D"));
+
+#endif
+
+  }
+
+  else if (estado == PARADO) {
+    Serial.print(F(" | 0 RPM"));
+  }
+}
+
+// ------------------------------------------------------------
+// 14. GRAVACAO NO SD
+// ------------------------------------------------------------
+
+#if HABILITAR_SD
+
+void gravarSD(
+  uint32_t tempo,
+  EstadoEixo e1,
+  uint32_t p1,
+  float r1,
+  float v1,
+  EstadoEixo e2,
+  uint32_t p2,
+  float r2,
+  float v2
+) {
+
+  if (!sdDisponivel || !arquivoLog) {
+    return;
+  }
+
+  arquivoLog.print(tempo);
+  arquivoLog.print(",");
+
+  arquivoLog.print(nomeEstado(e1));
+  arquivoLog.print(",");
+
+  if (e1 == ATIVO) {
+    arquivoLog.print(p1);
+    arquivoLog.print(",");
+    arquivoLog.print(r1, 2);
+    arquivoLog.print(",");
+#if HABILITAR_VELOCIDADE
+    arquivoLog.print(v1, 2);
+#else
+    arquivoLog.print("");
+#endif
+  } else {
+    arquivoLog.print(",");
+    arquivoLog.print((e1 == PARADO) ? "0.00" : "");
+    arquivoLog.print(",");
+    arquivoLog.print((e1 == PARADO) ? "0.00" : "");
+  }
+
+  arquivoLog.print(",");
+  arquivoLog.print(nomeEstado(e2));
+  arquivoLog.print(",");
+
+  if (e2 == ATIVO) {
+    arquivoLog.print(p2);
+    arquivoLog.print(",");
+    arquivoLog.print(r2, 2);
+    arquivoLog.print(",");
+#if HABILITAR_VELOCIDADE
+    arquivoLog.print(v2, 2);
+#else
+    arquivoLog.print("");
+#endif
+  } else {
+    arquivoLog.print(",");
+    arquivoLog.print((e2 == PARADO) ? "0.00" : "");
+    arquivoLog.print(",");
+    arquivoLog.print((e2 == PARADO) ? "0.00" : "");
+  }
+
+  arquivoLog.println();
+
+  if (arquivoLog.getWriteError()) {
+    Serial.println(F("ERRO DE GRAVACAO SD"));
+    arquivoLog.close();
+    sdDisponivel = false;
+  }
+}
+
+#endif
+
+// ------------------------------------------------------------
+// 15. SETUP
+// ------------------------------------------------------------
 
 void setup() {
 
-    Serial.begin(115200);
+  Serial.begin(115200);
 
-    pinMode(PINO_SENSOR_1, INPUT_PULLUP);
-    pinMode(PINO_SENSOR_2, INPUT_PULLUP);
+  pinMode(PINO_SENSOR_1, MODO_ENTRADA);
+  pinMode(PINO_SENSOR_2, MODO_ENTRADA);
 
-    attachInterrupt(
-        digitalPinToInterrupt(PINO_SENSOR_1),
-        ISR_Sensor1,
-        FALLING
-    );
+  Serial.println();
+  Serial.println(F("================================"));
+  Serial.println(F(" SISTEMA RPM - FORMULA SAE"));
+  Serial.println(F(" ARDUINO NANO"));
+  Serial.println(F("================================"));
 
-    attachInterrupt(
-        digitalPinToInterrupt(PINO_SENSOR_2),
-        ISR_Sensor2,
-        FALLING
-    );
+  Serial.print(F("PPR: "));
+  Serial.println(PPR);
 
-    Serial.println(F("=========================================="));
-    Serial.println(F("       SISTEMA DE MEDICAO - FORMULA SAE"));
-    Serial.println(F("=========================================="));
+  Serial.print(F("Filtro minimo (us): "));
+  Serial.println(FILTRO_MIN_US);
 
-    Serial.println(
-        F("EIXO 1 (RPM | km/h) || EIXO 2 (RPM | km/h)")
-    );
+  Serial.print(F("Timeout (us): "));
+  Serial.println(TIMEOUT_PARADO_US);
+
+#if HABILITAR_VELOCIDADE
+  Serial.println(F("Velocidade: HABILITADA"));
+#else
+  Serial.println(F("Velocidade: DESABILITADA"));
+#endif
+
+#if HABILITAR_SD
+  iniciarSD();
+#else
+  Serial.println(F("SD: DESABILITADO NO CODIGO"));
+#endif
+
+  attachInterrupt(
+    digitalPinToInterrupt(PINO_SENSOR_1),
+    ISR_Sensor1,
+    BORDA_SENSOR
+  );
+
+  attachInterrupt(
+    digitalPinToInterrupt(PINO_SENSOR_2),
+    ISR_Sensor2,
+    BORDA_SENSOR
+  );
+
+  Serial.println(F("Sensores configurados"));
+  Serial.println(F("Aguardando pulsos..."));
 }
 
-
-// =====================================================
-// 8. LOOP PRINCIPAL
-// =====================================================
+// ------------------------------------------------------------
+// 16. LOOP PRINCIPAL
+// ------------------------------------------------------------
 
 void loop() {
 
-    // -------------------------------------------------
-    // 8.1 VARIAVEIS LOCAIS PARA AQUISICAO
-    // -------------------------------------------------
+  uint32_t agoraUs;
 
-    uint32_t p1 = 0;
-    uint32_t p2 = 0;
+  uint32_t p1, p2;
+  uint32_t ultimo1, ultimo2;
 
-    uint32_t agoraUs;
+  bool referencia1Local;
+  bool referencia2Local;
 
-    bool temDado1 = false;
-    bool temDado2 = false;
+  bool valido1, valido2;
+  bool recebeu1, recebeu2;
 
-    bool ativoLocal1 = false;
-    bool ativoLocal2 = false;
+  // Leitura atomica das variaveis compartilhadas
+  noInterrupts();
 
-    bool houveParada1 = false;
-    bool houveParada2 = false;
+  agoraUs = micros();
 
+  // Verifica timeout do eixo 1
+  if (
+    temReferencia1 &&
+    (uint32_t)(agoraUs - ultimoPulso1) >= TIMEOUT_PARADO_US
+  ) {
+    temReferencia1 = false;
+    periodoValido1 = false;
+  }
 
-    // -------------------------------------------------
-    // 8.2 LEITURA ATOMICA E CONTROLE DE TIMEOUT
-    // -------------------------------------------------
+  // Verifica timeout do eixo 2
+  if (
+    temReferencia2 &&
+    (uint32_t)(agoraUs - ultimoPulso2) >= TIMEOUT_PARADO_US
+  ) {
+    temReferencia2 = false;
+    periodoValido2 = false;
+  }
 
-    noInterrupts();
+  p1 = periodo1;
+  p2 = periodo2;
 
-    agoraUs = micros();
+  ultimo1 = ultimoPulso1;
+  ultimo2 = ultimoPulso2;
 
-    // Captura dos dados do eixo 1
-    if (novoDado1) {
+  referencia1Local = temReferencia1;
+  referencia2Local = temReferencia2;
 
-        p1 = periodo1;
-        temDado1 = true;
+  valido1 = periodoValido1;
+  valido2 = periodoValido2;
 
-        novoDado1 = false;
+  recebeu1 = jaRecebeuPulso1;
+  recebeu2 = jaRecebeuPulso2;
+
+  interrupts();
+
+  // ----------------------------------------------------------
+  // IDENTIFICACAO DOS ESTADOS
+  // ----------------------------------------------------------
+
+  if (!recebeu1) {
+    estado1 = SEM_SINAL;
+  }
+  else if (!referencia1Local) {
+    estado1 = PARADO;
+  }
+  else if (!valido1) {
+    estado1 = AGUARDANDO;
+  }
+  else {
+    estado1 = ATIVO;
+  }
+
+  if (!recebeu2) {
+    estado2 = SEM_SINAL;
+  }
+  else if (!referencia2Local) {
+    estado2 = PARADO;
+  }
+  else if (!valido2) {
+    estado2 = AGUARDANDO;
+  }
+  else {
+    estado2 = ATIVO;
+  }
+
+  // ----------------------------------------------------------
+  // CALCULO DAS GRANDEZAS
+  // ----------------------------------------------------------
+
+  rpm1 = (estado1 == ATIVO) ? calcularRPM(p1) : 0.0f;
+  rpm2 = (estado2 == ATIVO) ? calcularRPM(p2) : 0.0f;
+
+  velocidade1 = calcularVelocidade(rpm1);
+  velocidade2 = calcularVelocidade(rpm2);
+
+  // ----------------------------------------------------------
+  // SERIAL
+  // ----------------------------------------------------------
+
+  const uint32_t agoraMs = millis();
+
+  const bool mudouEstado =
+    (estado1 != estadoAnterior1) ||
+    (estado2 != estadoAnterior2);
+
+  const bool intervaloSerial =
+    (uint32_t)(agoraMs - ultimaImpressaoSerial) >=
+    INTERVALO_SERIAL_MS;
+
+  if (
+    mudouEstado ||
+    (intervaloSerial &&
+     (estado1 == ATIVO || estado2 == ATIVO))
+  ) {
+
+    imprimirEixo("E1", estado1, rpm1, velocidade1);
+
+    Serial.print(F(" || "));
+
+    imprimirEixo("E2", estado2, rpm2, velocidade2);
+
+    Serial.println();
+
+    ultimaImpressaoSerial = agoraMs;
+  }
+
+  // ----------------------------------------------------------
+  // CARTAO SD
+  // ----------------------------------------------------------
+
+#if HABILITAR_SD
+
+  const bool existeMedicao =
+    (estado1 != SEM_SINAL) ||
+    (estado2 != SEM_SINAL);
+
+  const bool intervaloSD =
+    (uint32_t)(agoraMs - ultimaGravacaoSD) >=
+    INTERVALO_SD_MS;
+
+  if (sdDisponivel && existeMedicao && intervaloSD) {
+
+    gravarSD(
+      agoraMs,
+      estado1, p1, rpm1, velocidade1,
+      estado2, p2, rpm2, velocidade2
+    );
+
+    ultimaGravacaoSD = agoraMs;
+  }
+
+  // Flush periodico, sem forcar gravacao a cada linha
+  if (
+    sdDisponivel &&
+    (uint32_t)(agoraMs - ultimoFlushSD) >=
+    INTERVALO_FLUSH_MS
+  ) {
+
+    arquivoLog.flush();
+    ultimoFlushSD = agoraMs;
+
+    if (arquivoLog.getWriteError()) {
+      Serial.println(F("ERRO NO FLUSH DO SD"));
+      arquivoLog.close();
+      sdDisponivel = false;
     }
+  }
 
-    // Captura dos dados do eixo 2
-    if (novoDado2) {
+#endif
 
-        p2 = periodo2;
-        temDado2 = true;
-
-        novoDado2 = false;
-    }
-
-    // Verificacao de parada do eixo 1
-    if (referencia1 &&
-        (uint32_t)(agoraUs - ultimoPulso1) >= TIMEOUT_PARADO_US) {
-
-        referencia1 = false;
-        novoDado1 = false;
-
-        houveParada1 = true;
-    }
-
-    // Verificacao de parada do eixo 2
-    if (referencia2 &&
-        (uint32_t)(agoraUs - ultimoPulso2) >= TIMEOUT_PARADO_US) {
-
-        referencia2 = false;
-        novoDado2 = false;
-
-        houveParada2 = true;
-    }
-
-    // Captura dos estados atuais
-    ativoLocal1 = referencia1;
-    ativoLocal2 = referencia2;
-
-    interrupts();
-
-
-    // -------------------------------------------------
-    // 8.3 PROCESSAMENTO DO EIXO 1
-    // -------------------------------------------------
-
-    if (houveParada1 || !ativoLocal1) {
-
-        rpm1 = 0.0f;
-        velocidade1 = 0.0f;
-
-        medicaoValida1 = false;
-    }
-
-    else if (temDado1 && p1 > 0) {
-
-        rpm1 = 60000000.0f /
-               ((float)PPR * (float)p1);
-
-        velocidade1 = rpm1 * FATOR_ROTACAO_RODA * PERIMETRO_RODA_M * 60.0f / 1000.0f;
-
-        medicaoValida1 = true;
-    }
-
-    eixo1Ativo = ativoLocal1;
-
-
-    // -------------------------------------------------
-    // 8.4 PROCESSAMENTO DO EIXO 2
-    // -------------------------------------------------
-
-    if (houveParada2 || !ativoLocal2) {
-
-        rpm2 = 0.0f;
-        velocidade2 = 0.0f;
-
-        medicaoValida2 = false;
-    }
-
-    else if (temDado2 && p2 > 0) {
-
-        rpm2 = 60000000.0f /
-               ((float)PPR * (float)p2);
-
-        velocidade2 =
-            rpm2 *
-            FATOR_ROTACAO_RODA *
-            PERIMETRO_RODA_M *
-            60.0f / 1000.0f;
-
-        medicaoValida2 = true;
-    }
-
-    eixo2Ativo = ativoLocal2;
-
-
-    // -------------------------------------------------
-    // 8.5 DETECCAO DE MUDANCA DE ESTADO
-    // -------------------------------------------------
-
-    bool mudouEstado =
-        (eixo1Ativo != estadoAnterior1) ||
-        (eixo2Ativo != estadoAnterior2);
-
-
-    // -------------------------------------------------
-    // 8.6 CONTROLE DA FREQUENCIA DE IMPRESSAO
-    // -------------------------------------------------
-
-    uint32_t agoraMs = millis();
-
-    bool chegouIntervalo =
-        (uint32_t)(agoraMs - ultimaImpressaoMs)
-        >= INTERVALO_SERIAL_MS;
-
-
-    // Imprime durante a atividade ou quando ocorre
-    // uma transicao entre ativo e parado.
-
-    if ((eixo1Ativo || eixo2Ativo) &&
-        (chegouIntervalo || mudouEstado)) {
-
-        // ---------------- EIXO 1 ----------------
-
-        Serial.print(F("E1: "));
-
-        if (!eixo1Ativo) {
-
-            Serial.print(F("0.0 RPM | 0.0 km/h"));
-        }
-
-        else if (!medicaoValida1) {
-
-            Serial.print(F("AGUARDANDO PULSOS"));
-        }
-
-        else {
-
-            Serial.print(rpm1, 1);
-            Serial.print(F(" RPM | "));
-            Serial.print(velocidade1, 1);
-            Serial.print(F(" km/h"));
-        }
-
-        Serial.print(F(" || "));
-
-        // ---------------- EIXO 2 ----------------
-
-        Serial.print(F("E2: "));
-
-        if (!eixo2Ativo) {
-
-            Serial.print(F("0.0 RPM | 0.0 km/h"));
-        }
-
-        else if (!medicaoValida2) {
-
-            Serial.print(F("AGUARDANDO PULSOS"));
-        }
-
-        else {
-
-            Serial.print(rpm2, 1);
-            Serial.print(F(" RPM | "));
-            Serial.print(velocidade2, 1);
-            Serial.print(F(" km/h"));
-        }
-
-        Serial.println();
-
-        ultimaImpressaoMs = agoraMs;
-    }
-
-    // Quando ambos param, imprime zero somente uma vez.
-    else if (!eixo1Ativo &&
-             !eixo2Ativo &&
-             mudouEstado) {
-
-        Serial.println(
-            F("E1: 0.0 RPM | 0.0 km/h || E2: 0.0 RPM | 0.0 km/h")
-        );
-
-        ultimaImpressaoMs = agoraMs;
-    }
-
-
-    // -------------------------------------------------
-    // 8.7 ATUALIZACAO DOS ESTADOS ANTERIORES
-    // -------------------------------------------------
-
-    estadoAnterior1 = eixo1Ativo;
-    estadoAnterior2 = eixo2Ativo;
+  estadoAnterior1 = estado1;
+  estadoAnterior2 = estado2;
 }
